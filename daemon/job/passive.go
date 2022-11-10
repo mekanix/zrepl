@@ -36,6 +36,13 @@ type modeSink struct {
 	receiverConfig endpoint.ReceiverConfig
 }
 
+var nonexistingSourceDatasets = prometheus.NewGauge(prometheus.GaugeOpts{
+	Namespace: "zrepl",
+	Subsystem: "zfs",
+	Name:      "nonexisting_source_datasets",
+	Help:      "number of configured datasets that don't exist",
+})
+
 func (m *modeSink) Type() Type { return TypeSink }
 
 func (m *modeSink) Handler() rpc.Handler {
@@ -85,6 +92,32 @@ func (m *modeSource) Handler() rpc.Handler {
 
 func (m *modeSource) RunPeriodic(ctx context.Context) {
 	m.snapper.Run(ctx, nil)
+	if confErr == nil {
+		var neds = 0.
+		for _, element := range confData.Jobs {
+			switch v := element.Ret.(type) {
+			case *config.SourceJob:
+				for key := range v.Filesystems {
+					var datasetName string
+					if key[len(key)-1] == '<' {
+						datasetName = key[:len(key)-1]
+					} else {
+						datasetName = key
+					}
+					var f, _ = zfs.NewDatasetPath(datasetName)
+					var datasets, _ = zfs.ZFSListMapping(ctx, m.senderConfig.FSF)
+					var exists = false
+					for _, dataset := range datasets {
+						exists = exists || f.Equal(dataset)
+					}
+					if (!exists) {
+						neds = neds + 1
+					}
+				}
+			}
+		}
+		nonexistingSourceDatasets.Set(neds)
+	}
 }
 
 func (m *modeSource) SnapperReport() *snapper.Report {
@@ -149,7 +182,9 @@ func (j *PassiveSide) SenderConfig() *endpoint.SenderConfig {
 	return source.senderConfig
 }
 
-func (*PassiveSide) RegisterMetrics(registerer prometheus.Registerer) {}
+func (*PassiveSide) RegisterMetrics(registerer prometheus.Registerer) {
+	prometheus.Register(nonexistingSourceDatasets)
+}
 
 func (j *PassiveSide) Run(ctx context.Context) {
 	ctx, endTask := trace.WithTaskAndSpan(ctx, "passive-side-job", j.Name())

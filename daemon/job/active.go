@@ -72,6 +72,20 @@ type activeSideTasks struct {
 	prunerSenderCancel, prunerReceiverCancel context.CancelFunc
 }
 
+var confData, confErr = config.ParseConfig("")
+var nonexistingPushDatasets = prometheus.NewGauge(prometheus.GaugeOpts{
+	Namespace: "zrepl",
+	Subsystem: "zfs",
+	Name:      "nonexisting_push_datasets",
+	Help:      "number of configured datasets that don't exist",
+})
+var nonexistingPullDatasets = prometheus.NewGauge(prometheus.GaugeOpts{
+	Namespace: "zrepl",
+	Subsystem: "zfs",
+	Name:      "nonexisting_pull_datasets",
+	Help:      "number of configured datasets that don't exist",
+})
+
 func (a *ActiveSide) updateTasks(u func(*activeSideTasks)) activeSideTasks {
 	a.tasksMtx.Lock()
 	defer a.tasksMtx.Unlock()
@@ -112,6 +126,33 @@ func (m *modePush) ConnectEndpoints(ctx context.Context, connecter transport.Con
 	}
 	m.sender = endpoint.NewSender(*m.senderConfig)
 	m.receiver = rpc.NewClient(connecter, rpc.GetLoggersOrPanic(ctx))
+	if confErr == nil {
+		var neds = 0.
+		for _, element := range confData.Jobs {
+			switch v := element.Ret.(type) {
+			case *config.PushJob:
+				for key := range v.Filesystems {
+					var datasetName string
+					if key[len(key)-1] == '<' {
+						datasetName = key[:len(key)-1]
+					} else {
+						datasetName = key
+					}
+					var f, _ = zfs.NewDatasetPath(datasetName)
+					var datasets, _ = zfs.ZFSListMapping(ctx, m.senderConfig.FSF)
+					var exists = false
+					for _, dataset := range datasets {
+						exists = exists || f.Equal(dataset)
+					}
+					if (!exists) {
+						neds = neds + 1
+					}
+				}
+			}
+		}
+		fmt.Println("neds: ", neds)
+		nonexistingPushDatasets.Set(neds)
+	}
 }
 
 func (m *modePush) DisconnectEndpoints() {
@@ -134,6 +175,7 @@ func (m *modePush) PlannerPolicy() logic.PlannerPolicy { return *m.plannerPolicy
 
 func (m *modePush) RunPeriodic(ctx context.Context, wakeUpCommon chan<- struct{}) {
 	m.snapper.Run(ctx, wakeUpCommon)
+
 }
 
 func (m *modePush) SnapperReport() *snapper.Report {
@@ -452,6 +494,10 @@ func (j *ActiveSide) Run(ctx context.Context) {
 	go j.mode.RunPeriodic(periodicCtx, periodicDone)
 
 	invocationCount := 0
+
+	prometheus.Register(nonexistingPushDatasets)
+	prometheus.Register(nonexistingPullDatasets)
+
 outer:
 	for {
 		log.Info("wait for wakeups")

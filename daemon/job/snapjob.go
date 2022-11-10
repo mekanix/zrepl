@@ -36,6 +36,13 @@ type SnapJob struct {
 	pruner    *pruner.Pruner
 }
 
+var nonexistingSnapshotDatasets = prometheus.NewGauge(prometheus.GaugeOpts{
+	Namespace: "zrepl",
+	Subsystem: "zfs",
+	Name:      "nonexisting_snapshot_datasets",
+	Help:      "number of configured datasets that don't exist",
+})
+
 func (j *SnapJob) Name() string { return j.name.String() }
 
 func (j *SnapJob) Type() Type { return TypeSnap }
@@ -71,6 +78,7 @@ func snapJobFromConfig(g *config.Global, in *config.SnapJob) (j *SnapJob, err er
 
 func (j *SnapJob) RegisterMetrics(registerer prometheus.Registerer) {
 	registerer.MustRegister(j.promPruneSecs)
+	prometheus.Register(nonexistingSnapshotDatasets)
 }
 
 type SnapJobStatus struct {
@@ -112,6 +120,7 @@ func (j *SnapJob) Run(ctx context.Context) {
 	go j.snapper.Run(periodicCtx, periodicDone)
 
 	invocationCount := 0
+
 outer:
 	for {
 		log.Info("wait for wakeups")
@@ -126,6 +135,33 @@ outer:
 		invocationCount++
 
 		invocationCtx, endSpan := trace.WithSpan(ctx, fmt.Sprintf("invocation-%d", invocationCount))
+
+		if confErr == nil {
+			var neds = 0.
+			for _, element := range confData.Jobs {
+				switch v := element.Ret.(type) {
+				case *config.SnapJob:
+					for key := range v.Filesystems {
+						var datasetName string
+						if key[len(key)-1] == '<' {
+							datasetName = key[:len(key)-1]
+						} else {
+							datasetName = key
+						}
+						var f, _ = zfs.NewDatasetPath(datasetName)
+						var datasets, _ = zfs.ZFSListMapping(ctx, j.fsfilter)
+						var exists = false
+						for _, dataset := range datasets {
+							exists = exists || f.Equal(dataset)
+						}
+						if (!exists) {
+							neds = neds + 1
+						}
+					}
+				}
+			}
+			nonexistingSnapshotDatasets.Set(neds)
+		}
 		j.doPrune(invocationCtx)
 		endSpan()
 	}
